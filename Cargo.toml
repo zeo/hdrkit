@@ -1,0 +1,21 @@
+[package]
+name = "hdrkit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+publish = false
+description = "HDR display detection, SDR tonemap, PQ and resampling shaders for D3D11 on Windows"
+license = "MIT OR Apache-2.0"
+authors = ["zeo <96458554+zeo@users.noreply.github.com>"]
+
+[dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+] }
