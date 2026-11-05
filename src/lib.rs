@@ -1,7 +1,9 @@
-//! HDR on Windows over D3D11: what a monitor is doing, scRGB to SDR, scRGB or sRGB to HDR10 P010, and
-//! ratio aware resampling, all as pixel shaders.
+//! Pixel shaders for HDR screen capture on Windows: read a monitor's SDR white and peak, tonemap
+//! scRGB frames to sRGB, write scRGB or sRGB frames as HDR10 P010, and resample with kernels that
+//! widen with the downscale ratio.
 
-/// The windows crate these types come from, so a caller on another version can bridge through raw pointers
+/// Every D3D11 type in this crate's API comes from this version of `windows`. Callers on another
+/// version can pass interfaces across with `Interface::into_raw` and `from_raw`.
 pub use windows;
 use windows::core::{s, Error, Interface, Result, PCSTR};
 use windows::Win32::Devices::Display::*;
@@ -26,6 +28,8 @@ pub struct Display {
     pub peak: f32,
 }
 
+/// Fails with `DXGI_ERROR_NOT_FOUND` when no adapter drives `monitor`. SDR white falls back to
+/// 200 nits when the display config query fails, the panel peak to 1000 when the driver reports 0.
 pub fn display(monitor: HMONITOR) -> Result<Display> {
     let desc = output(monitor)?;
     let hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
@@ -310,7 +314,8 @@ impl Scaler {
         Ok(Self { program, pass: pass.ok_or(Error::from(E_FAIL))?, output: (texture, view), middle: None })
     }
 
-    /// Scales the `content` region of `source` into `dest` of the output and returns the output.
+    /// Scales the `content` region of `source` into `dest` of the output and returns the output,
+    /// which the next call draws over.
     pub fn apply(&mut self, source: &ID3D11Texture2D, content: (u32, u32), dest: RECT) -> Result<ID3D11Texture2D> {
         let size = size(source);
         let content = (content.0.clamp(1, size.0), content.1.clamp(1, size.1));
@@ -391,7 +396,7 @@ impl Program {
         unsafe {
             let mut input = None;
             self.device.CreateShaderResourceView(source, None, Some(&mut input))?;
-            // media foundation uses this context from its own threads, so hold it until the state is unbound
+            // encoders behind an IMFDXGIDeviceManager use the immediate context from their own threads
             let lock: ID3D11Multithread = self.context.cast()?;
             lock.Enter();
             let c = &self.context;
@@ -428,12 +433,14 @@ pub struct Tonemap {
 const KNEE: f32 = 0.8;
 
 impl Tonemap {
+    /// The white and peak are compiled into the shader, so build a new one when `display` changes.
     pub fn new(device: &ID3D11Device, display: Display) -> Result<Self> {
         let (knee, soft) = rolloff(display);
         let defines = [(s!("SCALE"), SCRGB_WHITE / display.sdr_white), (s!("KNEE"), knee), (s!("SOFT"), soft)];
         Ok(Self { program: Program::new(device, TONEMAP, &[s!("sdr")], &defines)?, target: None })
     }
 
+    /// Returns a BGRA texture the size of `source`, which the next call draws over.
     pub fn apply(&mut self, source: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
         let size = size(source);
         if self.target.as_ref().is_none_or(|t| t.2 != size) {
@@ -566,7 +573,6 @@ fn texture(device: &ID3D11Device, size: (u32, u32), format: DXGI_FORMAT) -> Resu
         Format: format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Usage: D3D11_USAGE_DEFAULT,
-        // the video processor and the encoders read through render target binding
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,
         MiscFlags: 0,
