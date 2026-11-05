@@ -115,6 +115,23 @@ fn tonemap_keeps_sdr_grey_and_puts_the_panel_peak_on_white() {
 }
 
 #[test]
+fn a_followed_display_matches_a_tonemap_built_for_it() {
+    let gpu = warp();
+    let dimmer = Display { sdr_white: 120.0, peak: 600.0, ..PANEL };
+    let mut followed = Tonemap::new(&gpu.0, PANEL).unwrap();
+    let mut fresh = Tonemap::new(&gpu.0, dimmer).unwrap();
+    let before = read(&gpu, &followed.apply(&scrgb(&gpu.0, 150.0)).unwrap()).0[1];
+    followed.follow(dimmer);
+    for nits in [60.0, 150.0, 400.0] {
+        let frame = scrgb(&gpu.0, nits);
+        let (a, b) =
+            (read(&gpu, &followed.apply(&frame).unwrap()).0[1], read(&gpu, &fresh.apply(&frame).unwrap()).0[1]);
+        assert_eq!(a, b, "{nits} nits");
+    }
+    assert_ne!(before, read(&gpu, &followed.apply(&scrgb(&gpu.0, 150.0)).unwrap()).0[1]);
+}
+
+#[test]
 fn pq_writes_st_2084_codes_with_neutral_chroma() {
     let gpu = warp();
     let mut pq = Pq::new(&gpu.0, (2, 2), 1).unwrap();

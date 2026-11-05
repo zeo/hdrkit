@@ -155,14 +155,20 @@ Vertex vs(uint id : SV_VertexID) {
 
 const TONEMAP: &str = r#"
 Texture2D<float4> frame : register(t0);
+cbuffer Curve : register(b0) {
+    // scRGB to sdr-relative linear light
+    float scale;
+    float knee;
+    float soft;
+};
 
 float4 sdr(float4 position : SV_Position) : SV_Target {
-    float3 c = max(frame.Load(int3(position.xy, 0)).rgb * SCALE, 0);
+    float3 c = max(frame.Load(int3(position.xy, 0)).rgb * scale, 0);
     float m = max(c.r, max(c.g, c.b));
     // one factor for all channels keeps the hue of bright colors
-    if (m > KNEE) {
-        float e = m - KNEE;
-        c *= (KNEE + e / (1 + e / SOFT)) / m;
+    if (m > knee) {
+        float e = m - knee;
+        c *= (knee + e / (1 + e / soft)) / m;
     }
     c = saturate(c);
     return float4(c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1 / 2.4) - 0.055, 1);
@@ -303,15 +309,7 @@ impl Scaler {
         let program = Program::new(device, RESAMPLE, &[s!("resample")], &[(s!("FILTER"), filter as u8 as f32)])?;
         let texture = texture(device, size, format)?;
         let view = view(device, &texture, format)?;
-        let mut pass = None;
-        let desc = D3D11_BUFFER_DESC {
-            ByteWidth: 32,
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-            ..Default::default()
-        };
-        unsafe { device.CreateBuffer(&desc, None, Some(&mut pass))? };
-        Ok(Self { program, pass: pass.ok_or(Error::from(E_FAIL))?, output: (texture, view), middle: None })
+        Ok(Self { program, pass: constants(device, 32)?, output: (texture, view), middle: None })
     }
 
     /// Scales the `content` region of `source` into `dest` of the output and returns the output,
@@ -330,11 +328,10 @@ impl Scaler {
         let limit = [content.0 as f32, content.1 as f32];
         let across = [content.0 as f32 / extent.0 as f32, 1.0, 1.0, 0.0];
         let down = [1.0, content.1 as f32 / extent.1 as f32, 0.0, 1.0];
-        let bind = |c: &ID3D11DeviceContext, offset: [f32; 2], scale_axis: [f32; 4]| unsafe {
-            let constants =
+        let bind = |c: &ID3D11DeviceContext, offset: [f32; 2], scale_axis: [f32; 4]| {
+            let values =
                 [offset[0], offset[1], scale_axis[0], scale_axis[1], scale_axis[2], scale_axis[3], limit[0], limit[1]];
-            c.UpdateSubresource(&self.pass, 0, None, constants.as_ptr() as _, 0, 0);
-            c.PSSetConstantBuffers(0, Some(&[Some(self.pass.clone())]));
+            upload(c, &self.pass, &values);
         };
         self.program.draw(source, |c| bind(c, [0.0, 0.0], across), &[(0, middle_view, viewport(0, 0, between))])?;
         let (output, view) = &self.output;
@@ -422,10 +419,12 @@ impl Program {
 }
 
 /// Turns scRGB FP16 frames into sRGB BGRA on the GPU: sdr content keeps its normal brightness
-/// and highlights roll off above a knee instead of clipping. Parameters come from the display
-/// once, so the result is the same in every frame.
+/// and highlights roll off above a knee instead of clipping. The curve comes from the display,
+/// not the frame, so it stays the same from frame to frame until the display changes.
 pub struct Tonemap {
     program: Program,
+    curve: ID3D11Buffer,
+    values: [f32; 4],
     target: Option<(ID3D11Texture2D, ID3D11RenderTargetView, (u32, u32))>,
 }
 
@@ -433,11 +432,14 @@ pub struct Tonemap {
 const KNEE: f32 = 0.8;
 
 impl Tonemap {
-    /// The white and peak are compiled into the shader, so build a new one when `display` changes.
     pub fn new(device: &ID3D11Device, display: Display) -> Result<Self> {
-        let (knee, soft) = rolloff(display);
-        let defines = [(s!("SCALE"), SCRGB_WHITE / display.sdr_white), (s!("KNEE"), knee), (s!("SOFT"), soft)];
-        Ok(Self { program: Program::new(device, TONEMAP, &[s!("sdr")], &defines)?, target: None })
+        let program = Program::new(device, TONEMAP, &[s!("sdr")], &[])?;
+        Ok(Self { program, curve: constants(device, 16)?, values: curve(display), target: None })
+    }
+
+    /// Takes on a new sdr white or peak from the next frame on, without recompiling anything.
+    pub fn follow(&mut self, display: Display) {
+        self.values = curve(display);
     }
 
     /// Returns a BGRA texture the size of `source`, which the next call draws over.
@@ -449,7 +451,7 @@ impl Tonemap {
             self.target = Some((texture, view, size));
         }
         let (texture, view, _) = self.target.as_ref().expect("created");
-        self.program.draw(source, |_| {}, &[(0, view, viewport(0, 0, size))])?;
+        self.program.draw(source, |c| upload(c, &self.curve, &self.values), &[(0, view, viewport(0, 0, size))])?;
         Ok(texture.clone())
     }
 }
@@ -483,17 +485,6 @@ impl Pq {
                 },
                 Some(&mut sampler),
             )?;
-            let mut crop = None;
-            device.CreateBuffer(
-                &D3D11_BUFFER_DESC {
-                    ByteWidth: 16,
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-                    ..Default::default()
-                },
-                None,
-                Some(&mut crop),
-            )?;
             let mut targets = Vec::with_capacity(count);
             for _ in 0..count {
                 let texture = texture(device, output, DXGI_FORMAT_P010)?;
@@ -505,7 +496,7 @@ impl Pq {
             Ok(Self {
                 program,
                 sampler: sampler.ok_or(Error::from(E_FAIL))?,
-                crop: crop.ok_or(Error::from(E_FAIL))?,
+                crop: constants(device, 16)?,
                 targets,
                 next: 0,
             })
@@ -538,8 +529,7 @@ impl Pq {
             let neutral = 512.0 * 64.0 / 65535.0;
             c.ClearRenderTargetView(luma, &[black, 0.0, 0.0, 0.0]);
             c.ClearRenderTargetView(chroma, &[neutral, neutral, 0.0, 0.0]);
-            c.UpdateSubresource(&self.crop, 0, None, crop.as_ptr() as _, 0, 0);
-            c.PSSetConstantBuffers(0, Some(&[Some(self.crop.clone())]));
+            upload(c, &self.crop, &crop);
             c.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
         };
         self.program.draw(source, setup, &[(0, luma, at(1)), (1, chroma, at(2))])?;
@@ -580,6 +570,26 @@ fn texture(device: &ID3D11Device, size: (u32, u32), format: DXGI_FORMAT) -> Resu
     let mut texture = None;
     unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
     texture.ok_or(Error::from(E_FAIL))
+}
+
+/// A pixel shader constant buffer of `bytes`, a multiple of 16
+fn constants(device: &ID3D11Device, bytes: u32) -> Result<ID3D11Buffer> {
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: bytes,
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        ..Default::default()
+    };
+    let mut buffer = None;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer))? };
+    buffer.ok_or(Error::from(E_FAIL))
+}
+
+fn upload(c: &ID3D11DeviceContext, buffer: &ID3D11Buffer, values: &[f32]) {
+    unsafe {
+        c.UpdateSubresource(buffer, 0, None, values.as_ptr() as _, 0, 0);
+        c.PSSetConstantBuffers(0, Some(&[Some(buffer.clone())]));
+    }
 }
 
 fn view(device: &ID3D11Device, texture: &ID3D11Texture2D, format: DXGI_FORMAT) -> Result<ID3D11RenderTargetView> {
@@ -624,6 +634,11 @@ fn bytes(blob: &ID3DBlob) -> &[u8] {
 /// Knee and softness of the highlight curve in sdr-relative linear light, where sdr white is 1.0.
 /// Above the knee `e / (1 + e / soft)` bends the panel peak exactly onto white without a kink.
 /// A panel no brighter than sdr white has nothing to roll off, so the knee moves out of reach.
+fn curve(display: Display) -> [f32; 4] {
+    let (knee, soft) = rolloff(display);
+    [SCRGB_WHITE / display.sdr_white, knee, soft, 0.0]
+}
+
 fn rolloff(display: Display) -> (f32, f32) {
     let peak = display.peak / display.sdr_white;
     let (range, room) = (peak - KNEE, 1.0 - KNEE);

@@ -25,7 +25,7 @@ let mut tonemap = hdrkit::Tonemap::new(&device, display)?;
 let sdr = tonemap.apply(&frame)?; // B8G8R8A8_UNORM, the size of frame, reused by the next call
 ```
 
-Build a new `Tonemap` when `display` returns something different. The values are baked into the shader.
+When `display` returns something different, say after the SDR brightness slider moves, pass it to `tonemap.follow`. The curve lives in a constant buffer, so following a change compiles nothing and costs no frame.
 
 The API uses `windows` 0.62 types, and the crate re-exports that version as `hdrkit::windows`. Code on another `windows` version can share one device by passing it across with `Interface::into_raw` and `from_raw`. Or it can do its capture entirely in `hdrkit::windows` types, like capscr's Desktop Duplication path.
 
@@ -35,7 +35,7 @@ The API uses `windows` 0.62 types, and the crate re-exports that version as `hdr
 cargo test
 ```
 
-The shader tests run on WARP, so they need no GPU and pass on a headless CI runner. They check that SDR grey 128 survives the tonemap and the panel peak reaches 255. They compare the PQ codes at 203 and 1000 nits against a separate ST 2084 implementation, require every filter to leave a frame untouched at 1:1, and require area to average one white column in four to a flat 64.
+The shader tests run on WARP, so they need no GPU and pass on a headless CI runner. They check that SDR grey 128 survives the tonemap, the panel peak reaches 255, and a followed display draws the same as a tonemap built for it. They compare the PQ codes at 203 and 1000 nits against a separate ST 2084 implementation, require every filter to leave a frame untouched at 1:1, and require area to average one white column in four to a flat 64.
 
 ## limits
 
