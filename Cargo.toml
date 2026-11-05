@@ -6,6 +6,7 @@ rust-version = "1.93"
 publish = false
 description = "HDR display detection, SDR tonemap, PQ and resampling shaders for D3D11 on Windows"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/zeo/hdrkit"
 authors = ["zeo <96458554+zeo@users.noreply.github.com>"]
 
 [dependencies]
